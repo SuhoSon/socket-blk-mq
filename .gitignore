@@ -1,0 +1,9 @@
+*.cmd
+*.ko
+*.mod*
+*.symvers
+*.o*
+*.order
+usocket_srv
+usocket_cli
+test
