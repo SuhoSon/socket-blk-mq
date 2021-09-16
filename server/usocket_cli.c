@@ -17,6 +17,8 @@ typedef unsigned short u16;
 #define READ		0
 #define WRITE		1
 
+char *servip = "127.0.0.1";
+
 typedef struct {
 	unsigned int op;
 	loff_t offset;
@@ -146,7 +148,7 @@ int main(int argc, char *argv[])
 	int ncores;
 	int server_fd;
 
-	init_serv_addr("127.0.0.1", 4444);
+	init_serv_addr(servip, 4444);
 
 	if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
 		perror("error: ");
