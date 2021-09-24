@@ -1,13 +1,14 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/sysinfo.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/sysinfo.h>
+#include <signal.h>
 
 #define SERV_DEBUG	0
 
@@ -24,10 +25,11 @@ typedef struct {
 	loff_t offset;
 	u64 size;
 	u16 tag;
-	char data[0];
 } packet_t;
 
+int ncores;
 int server_fd;
+int client_fd;
 struct sockaddr_in addr_srv;
 int addr_len = sizeof(addr_srv);
 
@@ -36,139 +38,121 @@ int recv_packet(int client_fd, packet_t *packet)
 	int len;
 
 	len = recv(client_fd, packet, sizeof(packet_t), 0);
-	if (len < 0) {
+	if (len <= 0)
 		perror("recv failed");
-		return -EFAULT;
-	} else if (len == 0)
-		return -ENOTCONN;
 
 #if SERV_DEBUG
 	printf("recv packet op(%d) offset(%lu) size(%llu) tag(%u)\n",
 			packet->op, packet->offset, packet->size, packet->tag);
 #endif
 
-	if (packet->op == INIT)
-		return 0;
-
-	return 0;
+	return len;
 }
 
-int write_data(int client_fd, FILE *f, packet_t *packet)
+int write_data(int client_fd, int fd, packet_t *packet, char *buffer)
 {
 	int len;
 
-	len = recv(client_fd, packet->data, packet->size, MSG_WAITALL);
-	if (len < 0) {
+	len = recv(client_fd, buffer, packet->size, MSG_WAITALL);
+	if (len <= 0) {
 		perror("recv failed");
-		return -EFAULT;
-	} else if (len == 0)
-		return -ENOTCONN;
+		return len;
+	}
 
 #if SERV_DEBUG
 	printf("write: offset(%ld) size(%llu)\n", packet->offset, packet->size);
-	printf("  data: %s\n", packet->data);
+	printf("  data: %s\n", buffer);
 #endif
 
-	fseek(f, packet->offset, SEEK_SET);
-	fwrite(packet->data, sizeof(char), packet->size, f);
+	pwrite(fd, buffer, packet->size, packet->offset);
 
 	len = send(client_fd, packet, sizeof(packet_t), 0);
-	if (len < 0) {
+	if (len <= 0)
 		perror("send failed");
-		return -EFAULT;
-	} else if (len == 0)
-		return -ENOTCONN;
 
 	return len;
 }
 
-int read_data(int client_fd, FILE *f, packet_t *packet)
+int read_data(int client_fd, int fd, packet_t *packet, char *buffer)
 {
-	char *base;
 	u64 len;
 
-	fseek(f, packet->offset, SEEK_SET);
-	fread(packet->data, sizeof(char), packet->size, f);
+	pread(fd, buffer, packet->size, packet->offset);
 
 #if SERV_DEBUG
 	printf("read: offset(%ld) size(%llu)\n", packet->offset, packet->size);
-	printf("  data: %s\n", packet->data);
+	printf("  data: %s\n", buffer);
 #endif
 
 	len = send(client_fd, packet, sizeof(packet_t), 0);
-	if (len < 0) {
+	if (len <= 0) {
 		perror("send failed");
-		return -EFAULT;
-	} else if (len == 0)
-		return -ENOTCONN;
-
-	len = send(client_fd, packet->data, packet->size, 0);
-	if (len < 0) {
-		perror("send failed");
-		return -EFAULT;
-	} else if (len == 0) {
-		return -ENOTCONN;
-	} else if (len != packet->size) {
-		printf("send: origin(%llu) real(%llu)\n", packet->size, len);
+		return len;
 	}
+
+	len = send(client_fd, buffer, packet->size, 0);
+	if (len <= 0)
+		perror("send failed");
 
 	return len;
 }
 
 void send_serv_cores(int client_fd, int ncores)
 {
-	if (send(client_fd, &ncores, sizeof(int), 0) < 0) {
+	if (send(client_fd, &ncores, sizeof(int), 0) <= 0) {
 		perror("can't initialized");
-		exit(EXIT_FAILURE);
+		return;
 	}
 
-	printf("notify %d cores\n", ncores);
+	printf("Connected.\n");
 }
 
-void handle_packet(char *file_path, int client_fd, int ncores)
+void handle_packet(char *file_path, int ncores)
 {
-	FILE *f = NULL;
-	packet_t *packet;
+	int fd;
+	packet_t packet;
+	char *buffer;
 
-	packet = malloc(sizeof(packet_t) + (2 * 1024 * 1024));
-	if (!packet) {
+	buffer = aligned_alloc(512, 2 * 1024 * 1024);
+	if (!buffer) {
 		perror("no memory");
 		return;
 	}
 
-	f = fopen(file_path, "r+");
-	if (!f) {
+	fd = open(file_path, O_RDWR | O_DIRECT);
+	if (fd < 0) {
 		perror("open error");
+		free(buffer);
 		return;
 	}
 
 	while (1) {
-		if (recv_packet(client_fd, packet))
+		if (recv_packet(client_fd, &packet) <= 0)
 			break;
 
-		switch (packet->op) {
+		switch (packet.op) {
 			case INIT:
 				send_serv_cores(client_fd, ncores);
 				goto out;
 			case READ:
-				read_data(client_fd, f, packet);
+				if (read_data(client_fd, fd, &packet, buffer) <= 0)
+					goto out;
 				break;
 			case WRITE:
-				write_data(client_fd, f, packet);
+				if (write_data(client_fd, fd, &packet, buffer) <= 0)
+					goto out;
 			default:
 				break;
 		}
 	}
 out:
-	free(packet);
-	fclose(f);
+	free(buffer);
+	close(fd);
 }
 
 void run_server(char *file_path, int ncores)
 {
-	int client_fd;
 	int pid;
-	int cnt = 0;
 
 	while (1) {
 		if ((client_fd = accept(server_fd, (struct sockaddr *)&addr_srv,
@@ -177,12 +161,12 @@ void run_server(char *file_path, int ncores)
 		} else { 
 			if ((pid = fork()) == 0) {
 				close(server_fd);
-				handle_packet(file_path, client_fd, ncores);
+				server_fd = -1;
+				handle_packet(file_path, ncores);
 				close(client_fd);
 				exit(0);
-			} else if (pid < 0) {
+			} else if (pid < 0)
 				perror("fork failed");
-			}
 		}
 	}
 }
@@ -217,15 +201,25 @@ void init_server(int ncores)
 	}
 }
 
+void sigint_handler(int sig)
+{
+	if (server_fd > 0)
+		close(server_fd);
+	if (client_fd > 0)
+		close(client_fd);
+	exit(0);
+}
+
 int main(int argc, char *argv[])
 {
 	char file_path[4096];
-	int ncores;
 
 	if (argc < 2) {
 		printf("Usage: ./usocket_srv file_path\n");
 		return -EINVAL;
 	}
+
+	signal(SIGINT, sigint_handler);
 
 	memcpy(file_path, argv[1], strlen(argv[1]));
 	ncores = get_nprocs();
@@ -237,8 +231,6 @@ int main(int argc, char *argv[])
 			ncores, PORT, file_path);
 
 	run_server(file_path, ncores);
-
-	close(server_fd);
 
 	return 0;
 }

@@ -5,7 +5,7 @@ filename=/dev/socketdev0
 size=100GB
 runtime=30
 time_based
-numjobs=8
+numjobs=16
 direct=1
 group_reporting
 

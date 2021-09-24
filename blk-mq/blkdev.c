@@ -17,6 +17,8 @@
 
 #define BLKDEV_DEBUG	0
 
+#define SUBMISSION_BATCH_SZ	1000
+
 #define BLKDEV_ERRMSG printk(KERN_ERR "[%s %d] %s call %p \n", \
 				__FILE__, __LINE__, __FUNCTION__, __builtin_return_address(0))
 
@@ -25,11 +27,11 @@ typedef struct {
 	loff_t offset;
 	u64 size;
 	u16 tag;
-	char data[0];
 } packet_t;
 
 typedef struct {
 	struct llist_node llnode;
+	struct request *rq;
 	packet_t packet;
 } qentry_t;
 
@@ -46,38 +48,38 @@ static int addr_len;
 static int blkdev_major = 0;
 static block_dev_t *blkdev_dev = NULL;
 
-int send_packet(ksocket_t socket, packet_t *packet)
+int send_packet(ksocket_t socket, packet_t *packet, struct request *rq)
 {
-	int ret;
+	struct bio_vec bvec;
+	struct req_iterator iter;
+	int len;
 
 #if BLKDEV_DEBUG
 	printk("send packet: op(%u) offset(%llu) size(%llu) tag(%u)\n",
 			packet->op, packet->offset, packet->size, packet->tag);
 #endif
 
-	ret = ksend(socket, packet, sizeof(packet_t), 0);
-	if (ret < 0) {
+	len = ksend(socket, packet, sizeof(packet_t), 0);
+	if (len <= 0) {
 		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
+		return len;
 	}
 
 	if (!op_is_write(packet->op))
 		return 0;
 
-	// TODO: slice packet
-	ret = ksend(socket, packet->data, packet->size, 0);
-	if (ret < 0) {
-		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
+	rq_for_each_segment(bvec, rq, iter) {
+		unsigned long b_len = bvec.bv_len;
+		void *b_buf = page_address(bvec.bv_page) + bvec.bv_offset;
+
+		len = ksend(socket, b_buf, b_len, 0);
+		if (len <= 0) {
+			BLKDEV_ERRMSG;
+			return len;
+		}
 	}
 
-	return 0;
+	return len;
 }
 
 static void blkdev_submission(void *data)
@@ -85,117 +87,116 @@ static void blkdev_submission(void *data)
 	struct llist_node *node = NULL;
 	qentry_t *next;
 	ksocket_t socket = data;
+	int batch = SUBMISSION_BATCH_SZ;
 
 	while (!kthread_should_stop()) {
-		if (llist_empty(&sq))
-			goto skip;
+		while (!llist_empty(&sq)) {
+			spin_lock(&sq_lock);
+			node = llist_del_first(&sq);
+			spin_unlock(&sq_lock);
 
-		spin_lock(&sq_lock);
-		node = llist_del_first(&sq);
-		spin_unlock(&sq_lock);
+			if (!node)
+				break;
 
-		if (!node)
-			goto skip;
+			next = llist_entry(node, qentry_t, llnode);
 
-		next = llist_entry(node, qentry_t, llnode);
+			send_packet(socket, &(next->packet), next->rq);
 
-		send_packet(socket, &(next->packet));
+			kfree(next);
 
-		kfree(next);
-skip:
+			if (!(--batch)) {
+				batch = SUBMISSION_BATCH_SZ;
+				break;
+			}
+		}
 		io_schedule();
 	}
 
 	do_exit(0);
 }
 
-int recv_packet(packet_t *packet, ksocket_t socket)
+ssize_t recv_packet(packet_t *packet, ksocket_t socket, char *buffer)
 {
-	int ret;
+	int len;
 
-	ret = krecv(socket, packet, sizeof(packet_t), 0);
-	if (ret < 0) {
+	len = krecv(socket, packet, sizeof(packet_t), MSG_DONTWAIT);
+	if (len == -EAGAIN) {
+		return 0;
+	} else if (len <= 0) {
 		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
+		return len;
 	}
 
 	if (op_is_write(packet->op))
-		return 0;
+		return len;
 
-	ret = krecv(socket, packet->data, packet->size, MSG_WAITALL);
-	if (ret < 0) {
+	len = krecv(socket, buffer, packet->size, MSG_WAITALL);
+	if (len <= 0)
 		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
-	}
 
-	return 0;
+	return len;
 }
 
 static void blkdev_completion(void *data)
 {
-	struct request *rq;
-	packet_t *packet;
 	ksocket_t socket = data;
+	struct request *rq;
+
+	packet_t packet;
+	char *buffer;
+
 	struct bio_vec bvec;
 	struct req_iterator iter;
 	loff_t pos = 0;
 
-	packet = kmalloc(sizeof(packet_t) + (2 * 1024 * 1024), GFP_KERNEL);
-	if (!packet) {
+	buffer = kmalloc(2 * 1024 * 1024, GFP_KERNEL);
+	if (!buffer) {
 		BLKDEV_ERRMSG;
 		return;
 	}
 
 	while (!kthread_should_stop()) {
-		if (recv_packet(packet, socket))
-			goto skip;
+		if (recv_packet(&packet, socket, buffer) <= 0)
+			continue;
 
-		rq = blk_mq_tag_to_rq(blkdev_dev->tag_set.tags[0], packet->tag);
+		rq = blk_mq_tag_to_rq(blkdev_dev->tag_set.tags[0], packet.tag);
 		if (!rq) {
 			BLKDEV_ERRMSG;
-			goto skip;
+			continue;
 		}
 
-		if (rq_data_dir(rq) == READ) {
+		if (!op_is_write(packet.op)) {
 			pos = 0;
 			rq_for_each_segment(bvec, rq, iter) {
 				unsigned long b_len = bvec.bv_len;
 				void *b_buf = page_address(bvec.bv_page) + bvec.bv_offset;
 
-				memcpy(b_buf, packet->data + pos, b_len);
+				memcpy(b_buf, buffer + pos, b_len);
 
 				pos += b_len;
 			}
 		}
 
 		blk_mq_complete_request(rq);
-skip:
-		io_schedule();
 	}
 
-	kfree(packet);
+	kfree(buffer);
+
+	do_exit(0);
 }
 
 static qentry_t *create_entry(struct request *rq)
 {
 	qentry_t *entry;
 	packet_t *packet;
-	struct bio_vec bvec;
-	struct req_iterator iter;
-	loff_t pos = 0;
 
-	if (op_is_write(rq_data_dir(rq)))
-		entry = kmalloc(sizeof(qentry_t) + blk_rq_bytes(rq), GFP_KERNEL);
-	else
-		entry = kmalloc(sizeof(qentry_t), GFP_KERNEL);
-	if (!entry)
+	entry = kmalloc(sizeof(qentry_t), GFP_KERNEL);
+	if (!entry) {
+		BLKDEV_ERRMSG;
 		return NULL;
+	}
+
+	entry->rq = rq;
 
 	packet = &(entry->packet);
 
@@ -204,23 +205,13 @@ static qentry_t *create_entry(struct request *rq)
 	packet->tag = rq->tag;
 	packet->size = blk_rq_bytes(rq);
 
-	if (op_is_write(rq_data_dir(rq))) {
-		rq_for_each_segment(bvec, rq, iter) {
-			unsigned long b_len = bvec.bv_len;
-			void *b_buf = page_address(bvec.bv_page) + bvec.bv_offset;
-
-			memcpy(packet->data + pos, b_buf, b_len);
-
-			pos += b_len;
-		}
-	}
-
 	return entry;
 }
 
 static blk_status_t queue_rq(struct blk_mq_hw_ctx *hctx,
 		const struct blk_mq_queue_data *bd)
 {
+	int id = get_cpu();
 	struct request *rq = bd->rq;
 	qentry_t *entry;
 
@@ -323,21 +314,15 @@ static int get_serv_cores(void)
 	packet.op = INIT;
 
 	ret = ksend(socket, &packet, sizeof(packet_t), 0);
-	if (ret < 0) {
+	if (ret <= 0) {
 		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
+		return ret;
 	}
 
 	ret = krecv(socket, &cores, sizeof(int), 0);
-	if (ret < 0) {
+	if (ret <= 0) {
 		BLKDEV_ERRMSG;
-		return -EFAULT;
-	} else if (ret == 0) {
-		BLKDEV_ERRMSG;
-		return -ENOTCONN;
+		return ret;
 	}
 
 	clear_socket(socket);
@@ -597,9 +582,10 @@ static void __exit blkdev_exit(void)
 {
 	struct llist_node *node = NULL;
 	qentry_t *next;
+
 	clear_threads(sq_threads);
-	clear_sockets();
 	clear_threads(cq_threads);
+	clear_sockets();
 
 	while (!llist_empty(&sq)) {
 		node = llist_del_first(&sq);
