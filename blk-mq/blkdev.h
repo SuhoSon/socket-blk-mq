@@ -45,8 +45,6 @@ module_param(name, charp, 0);
 static char *sz = "1GB";
 module_param(sz, charp, 0);
 
-static int ncores = 4;
-
 static int blkdev_alloc_buffer(block_dev_t *dev);
 static void blkdev_free_buffer(block_dev_t *dev);
 static int blkdev_add_device(void);

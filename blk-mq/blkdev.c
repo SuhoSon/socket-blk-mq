@@ -12,8 +12,8 @@
 #include <linux/net.h>
 #include <linux/socket.h>
 #include <linux/uaccess.h>
-#include <linux/llist.h>
 #include <linux/kthread.h>
+#include <linux/llist.h>
 
 #define BLKDEV_DEBUG	0
 
@@ -30,90 +30,29 @@ typedef struct {
 } packet_t;
 
 typedef struct {
-	struct llist_node llnode;
+	struct llist_node node;
 	struct request *rq;
-	packet_t packet;
-} qentry_t;
+} entry_t;
 
-static LLIST_HEAD(sq); // submission queue
-static spinlock_t sq_lock;
+typedef struct {
+	int id;
+	struct llist_head sq;
+	struct work_struct submission_work;
+	struct workqueue_struct *submission_wq;
+} work_t;
 
-static struct task_struct **sq_threads;
-static struct task_struct **cq_threads;
+static int ncores;
+static int *hctx_id;
+
 static ksocket_t *sockets;
+static struct task_struct **cq_threads;
+static work_t *sqworks;
 
 /* Module parameters */
 static struct sockaddr_in addr_srv;
 static int addr_len;
 static int blkdev_major = 0;
 static block_dev_t *blkdev_dev = NULL;
-
-int send_packet(ksocket_t socket, packet_t *packet, struct request *rq)
-{
-	struct bio_vec bvec;
-	struct req_iterator iter;
-	int len;
-
-#if BLKDEV_DEBUG
-	printk("send packet: op(%u) offset(%llu) size(%llu) tag(%u)\n",
-			packet->op, packet->offset, packet->size, packet->tag);
-#endif
-
-	len = ksend(socket, packet, sizeof(packet_t), 0);
-	if (len <= 0) {
-		BLKDEV_ERRMSG;
-		return len;
-	}
-
-	if (!op_is_write(packet->op))
-		return 0;
-
-	rq_for_each_segment(bvec, rq, iter) {
-		unsigned long b_len = bvec.bv_len;
-		void *b_buf = page_address(bvec.bv_page) + bvec.bv_offset;
-
-		len = ksend(socket, b_buf, b_len, 0);
-		if (len <= 0) {
-			BLKDEV_ERRMSG;
-			return len;
-		}
-	}
-
-	return len;
-}
-
-static void blkdev_submission(void *data)
-{
-	struct llist_node *node = NULL;
-	qentry_t *next;
-	ksocket_t socket = data;
-	int batch = SUBMISSION_BATCH_SZ;
-
-	while (!kthread_should_stop()) {
-		while (!llist_empty(&sq)) {
-			spin_lock(&sq_lock);
-			node = llist_del_first(&sq);
-			spin_unlock(&sq_lock);
-
-			if (!node)
-				break;
-
-			next = llist_entry(node, qentry_t, llnode);
-
-			send_packet(socket, &(next->packet), next->rq);
-
-			kfree(next);
-
-			if (!(--batch)) {
-				batch = SUBMISSION_BATCH_SZ;
-				break;
-			}
-		}
-		io_schedule();
-	}
-
-	do_exit(0);
-}
 
 ssize_t recv_packet(packet_t *packet, ksocket_t socket, char *buffer)
 {
@@ -126,6 +65,11 @@ ssize_t recv_packet(packet_t *packet, ksocket_t socket, char *buffer)
 		BLKDEV_ERRMSG;
 		return len;
 	}
+
+#if BLKDEV_DEBUG
+	printk("recv packet: op(%u) offset(%llu) size(%llu) tag(%u)\n",
+			packet->op, packet->offset, packet->size, packet->tag);
+#endif
 
 	if (op_is_write(packet->op))
 		return len;
@@ -185,12 +129,75 @@ static void blkdev_completion(void *data)
 	do_exit(0);
 }
 
-static qentry_t *create_entry(struct request *rq)
+int send_packet(ksocket_t socket, struct request *rq)
 {
-	qentry_t *entry;
-	packet_t *packet;
+	struct bio_vec bvec;
+	struct req_iterator iter;
+	packet_t packet;
+	int len;
 
-	entry = kmalloc(sizeof(qentry_t), GFP_KERNEL);
+	packet.op = rq_data_dir(rq);
+	packet.offset = blk_rq_pos(rq) << SECTOR_SHIFT;
+	packet.size = blk_rq_bytes(rq);
+	packet.tag = rq->tag;
+
+#if BLKDEV_DEBUG
+	printk("send packet: op(%u) offset(%llu) size(%llu) tag(%u)\n",
+			packet.op, packet.offset, packet.size, packet.tag);
+#endif
+
+	len = ksend(socket, &packet, sizeof(packet_t), 0);
+	if (len <= 0) {
+		BLKDEV_ERRMSG;
+		return len;
+	}
+
+	if (!op_is_write(packet.op))
+		return 0;
+
+	rq_for_each_segment(bvec, rq, iter) {
+		unsigned long b_len = bvec.bv_len;
+		void *b_buf = page_address(bvec.bv_page) + bvec.bv_offset;
+
+		len = ksend(socket, b_buf, b_len, 0);
+		if (len <= 0) {
+			BLKDEV_ERRMSG;
+			return len;
+		}
+	}
+
+	return len;
+}
+
+static void do_submission(struct work_struct *work)
+{
+	work_t *sqwork = container_of(work, work_t, submission_work);
+	struct llist_node *node;
+	entry_t *entry;
+
+	while (!llist_empty(&sqwork->sq)) {
+		node = llist_del_first(&sqwork->sq);
+		if (!node)
+			break;
+
+		entry = llist_entry(node, entry_t, node);
+
+		send_packet(sockets[sqwork->id], entry->rq);
+
+		kfree(entry);
+	}
+}
+
+static int get_hctx_id(int cpu)
+{
+	return hctx_id[cpu];
+}
+
+static entry_t *create_entry(struct request *rq)
+{
+	entry_t *entry;
+
+	entry = kmalloc(sizeof(entry_t), GFP_KERNEL);
 	if (!entry) {
 		BLKDEV_ERRMSG;
 		return NULL;
@@ -198,22 +205,16 @@ static qentry_t *create_entry(struct request *rq)
 
 	entry->rq = rq;
 
-	packet = &(entry->packet);
-
-	packet->op = rq_data_dir(rq);
-	packet->offset = blk_rq_pos(rq) << SECTOR_SHIFT;
-	packet->tag = rq->tag;
-	packet->size = blk_rq_bytes(rq);
-
 	return entry;
 }
 
 static blk_status_t queue_rq(struct blk_mq_hw_ctx *hctx,
 		const struct blk_mq_queue_data *bd)
 {
-	int id = get_cpu();
+	entry_t *entry;
 	struct request *rq = bd->rq;
-	qentry_t *entry;
+	int id = get_hctx_id(smp_processor_id());
+	work_t *sqwork = &sqworks[id];
 
 	blk_mq_start_request(rq);
 
@@ -221,7 +222,9 @@ static blk_status_t queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (!entry)
 		return BLK_STS_IOERR;
 
-	llist_add(&entry->llnode, &sq);
+	llist_add(&entry->node, &sqwork->sq);
+
+	queue_work(sqwork->submission_wq, &sqwork->submission_work);
 
 	return BLK_STS_OK;
 }
@@ -268,21 +271,24 @@ static const struct block_device_operations blk_fops = {
 	.ioctl = dev_ioctl,
 };
 
-static void init_serv_addr(char *addr, int port)
-{
-	memset(&addr_srv, 0, sizeof(addr_srv));
-	addr_srv.sin_family = AF_INET;
-	addr_srv.sin_addr.s_addr = inet_addr(addr);
-	addr_srv.sin_port = htons(port);
-	addr_len = sizeof(struct sockaddr_in);
-}
-
 static void clear_socket(ksocket_t socket)
 {
 	if (socket) {
 		kshutdown(socket, SHUT_RDWR);
 		kclose(socket);
 	}
+}
+
+static void clear_sockets(void)
+{
+	int core;
+
+	for (core=0; core<ncores; core++) {
+		clear_socket(sockets[core]);
+		sockets[core] = NULL;
+	}
+
+	kfree(sockets);
 }
 
 static int create_socket(ksocket_t *socket)
@@ -297,6 +303,37 @@ static int create_socket(ksocket_t *socket)
 		return -ENOTCONN;
 	}
 	return 0;
+}
+
+static int create_sockets(void)
+{
+	int ret;
+	int core;
+
+	sockets = kmalloc(sizeof(ksocket_t) * ncores, GFP_KERNEL);
+	if (!sockets) {
+		BLKDEV_ERRMSG;
+		return -ENOMEM;
+	}
+
+	for (core=0; core<ncores; core++) {
+		if ((ret = create_socket(&sockets[core])) != 0) {
+			BLKDEV_ERRMSG;
+			clear_sockets();
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static void init_serv_addr(char *addr, int port)
+{
+	memset(&addr_srv, 0, sizeof(addr_srv));
+	addr_srv.sin_family = AF_INET;
+	addr_srv.sin_addr.s_addr = inet_addr(addr);
+	addr_srv.sin_port = htons(port);
+	addr_len = sizeof(struct sockaddr_in);
 }
 
 static int get_serv_cores(void)
@@ -330,36 +367,20 @@ static int get_serv_cores(void)
 	return cores;
 }
 
-static void clear_sockets(void)
+static int map_ctx_to_hctx(void)
 {
-	int core;
+	int ncpus = num_online_cpus();
+	int ctx, hctx;
 
-	for (core=0; core<ncores; core++) {
-		clear_socket(sockets[core]);
-		sockets[core] = NULL;
-	}
-
-	kfree(sockets);
-}
-
-static int create_sockets(void)
-{
-	int ret;
-	int core;
-
-	sockets = kmalloc(sizeof(ksocket_t) * ncores, GFP_KERNEL);
-	if (!sockets) {
+	hctx_id = kmalloc(sizeof(int) * ncpus, GFP_KERNEL);
+	if (!hctx_id) {
 		BLKDEV_ERRMSG;
 		return -ENOMEM;
 	}
 
-	for (core=0; core<ncores; core++) {
-		if ((ret = create_socket(&sockets[core])) != 0) {
-			BLKDEV_ERRMSG;
-			clear_sockets();
-			return ret;
-		}
-	}
+	for (ctx = 0; ctx < ncpus; ctx++)
+		for (hctx = 0; hctx < ncores; hctx++)
+			hctx_id[ctx] = hctx;
 
 	return 0;
 }
@@ -402,6 +423,41 @@ static struct task_struct **create_threads(void *fn)
 	}
 
 	return threads;
+}
+
+static void clear_sqworks(void)
+{
+	int core;
+
+	for (core = 0; core < ncores; core++) {
+		if (sqworks[core].submission_wq)
+			destroy_workqueue(sqworks[core].submission_wq);
+	}
+
+	kfree(sqworks);
+}
+
+static int create_sqworks(void)
+{
+	int core;
+
+	sqworks = kmalloc(sizeof(work_t) * ncores, GFP_KERNEL);
+	if (!sqworks)
+		return -ENOMEM;
+
+	for (core = 0; core < ncores; core++) {
+		sqworks[core].submission_wq = alloc_workqueue("blkdevsq", WQ_MEM_RECLAIM, 0);
+		if (!sqworks[core].submission_wq) {
+			BLKDEV_ERRMSG;
+			clear_sqworks();
+			return -ENOMEM;
+		}
+		INIT_WORK(&sqworks[core].submission_work, do_submission);
+		init_llist_head(&sqworks[core].sq);
+		sqworks[core].id = core;
+	}
+
+	return 0;
 }
 
 static int blkdev_alloc_buffer(block_dev_t *dev)
@@ -527,13 +583,15 @@ static void blkdev_remove_device(void)
 	blkdev_dev = NULL;
 }
 
-
 static int __init blkdev_init(void)
 {
 	int ret;
 
 	init_serv_addr(servaddr, servport);
 	ncores = get_serv_cores();
+
+	if ((ret = map_ctx_to_hctx()) != 0)
+		goto err_mapping;
 
 	if ((ret = create_sockets()) != 0)
 		goto err_socket;
@@ -543,12 +601,8 @@ static int __init blkdev_init(void)
 		goto err_cq;
 	}
 
-	if ((sq_threads = create_threads(blkdev_submission)) == NULL) {
-		ret = -EFAULT;
-		goto err_sq;
-	}
-
-	spin_lock_init(&sq_lock);
+	if ((ret = create_sqworks()) != 0)
+		goto err_sqworks;
 
 	blkdev_major = register_blkdev(blkdev_major, name);
 	if (blkdev_major <= 0) {
@@ -560,43 +614,38 @@ static int __init blkdev_init(void)
 	if ((ret = blkdev_add_device()) != 0)
 		goto err_adddev;
 
-	printk("%s init\n - size:%llu \n - server address: %s:%d \n - %d threads\n",
+	printk("%s init\n - size: %llu bytes \n - server address: %s:%d \n"
+			" - number of ctx: %d \n - number of hctx: %d \n",
 			name, blkdev_dev->capacity << SECTOR_SHIFT,
-			servaddr, servport, ncores);
+			servaddr, servport, num_online_cpus(), ncores);
 
 	return 0;
 
 err_adddev:
 	unregister_blkdev(blkdev_major, name);
 err_register:
-	clear_threads(sq_threads);
-err_sq:
+	clear_sqworks();
+err_sqworks:
 	clear_threads(cq_threads);
 err_cq:
 	clear_sockets();
 err_socket:
+	kfree(hctx_id);
+err_mapping:
 	return ret;
 }
 
 static void __exit blkdev_exit(void)
 {
-	struct llist_node *node = NULL;
-	qentry_t *next;
-
-	clear_threads(sq_threads);
-	clear_threads(cq_threads);
-	clear_sockets();
-
-	while (!llist_empty(&sq)) {
-		node = llist_del_first(&sq);
-		next = llist_entry(node, qentry_t, llnode);
-		kfree(next);
-	}
-
 	blkdev_remove_device();
 
 	if (blkdev_major > 0)
 		unregister_blkdev(blkdev_major, name);
+
+	clear_sqworks();
+	clear_threads(cq_threads);
+	clear_sockets();
+	kfree(hctx_id);
 
 	printk("%s exit\n", name);
 }
