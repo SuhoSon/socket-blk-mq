@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
 #include <signal.h>
 
 #define SERV_DEBUG	0
@@ -152,21 +153,32 @@ out:
 
 void run_server(char *file_path, int ncores)
 {
-	int pid;
+	pid_t pid1;
+	pid_t pid2;
+	int status;
 
 	while (1) {
 		if ((client_fd = accept(server_fd, (struct sockaddr *)&addr_srv,
 						(socklen_t *)&addr_len)) < 0) {
 			perror("accept failed");
 		} else { 
-			if ((pid = fork()) == 0) {
-				close(server_fd);
-				server_fd = -1;
-				handle_packet(file_path, ncores);
-				close(client_fd);
-				exit(0);
-			} else if (pid < 0)
+			if ((pid1 = fork()) == 0) {
+				if ((pid2 = fork()) == 0) {
+					close(server_fd);
+					server_fd = -1;
+					handle_packet(file_path, ncores);
+					close(client_fd);
+					exit(0);
+				} else if (pid2 > 0) {
+					exit(0);
+				} else {
+					perror("fork failed");
+				}
+			} else if (pid1 > 0) {
+				waitpid(pid1, &status, 0);
+			} else {
 				perror("fork failed");
+			}
 		}
 	}
 }
@@ -221,7 +233,8 @@ int main(int argc, char *argv[])
 
 	signal(SIGINT, sigint_handler);
 
-	memcpy(file_path, argv[1], strlen(argv[1]));
+	// memcpy(file_path, argv[1], strlen(argv[1]));
+	sprintf(file_path, "%s", "/mnt/nvme/data_file");
 	ncores = get_nprocs();
 	ncores = 4;
 

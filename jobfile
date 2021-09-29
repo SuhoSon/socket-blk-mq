@@ -5,7 +5,8 @@ filename=/dev/socketdev0
 size=100GB
 runtime=30
 time_based
-numjobs=16
+cpus_allowed=15-31
+cpus_allowed_policy=split
 direct=1
 group_reporting
 
