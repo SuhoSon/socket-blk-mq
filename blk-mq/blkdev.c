@@ -511,7 +511,6 @@ static void blkdev_remove_device(void)
 	blkdev_dev = NULL;
 }
 
-
 static int __init blkdev_init(void)
 {
 	int ret;

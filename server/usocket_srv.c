@@ -38,8 +38,8 @@ int recv_packet(int client_fd, packet_t *packet)
 {
 	int len;
 
-	len = recv(client_fd, packet, sizeof(packet_t), 0);
-	if (len <= 0)
+	len = recv(client_fd, packet, sizeof(packet_t), MSG_WAITALL);
+	if (len != sizeof(packet_t))
 		perror("recv failed");
 
 #if SERV_DEBUG
@@ -55,7 +55,7 @@ int write_data(int client_fd, int fd, packet_t *packet, char *buffer)
 	int len;
 
 	len = recv(client_fd, buffer, packet->size, MSG_WAITALL);
-	if (len <= 0) {
+	if (len != packet->size) {
 		perror("recv failed");
 		return len;
 	}
@@ -65,9 +65,12 @@ int write_data(int client_fd, int fd, packet_t *packet, char *buffer)
 	printf("  data: %s\n", buffer);
 #endif
 
-	pwrite(fd, buffer, packet->size, packet->offset);
+	if (pwrite(fd, buffer, packet->size, packet->offset) != packet->size) {
+		perror("pwrite fail");
+		return -1;
+	}
 
-	len = send(client_fd, packet, sizeof(packet_t), 0);
+	len = send(client_fd, packet, sizeof(packet_t), MSG_EOR);
 	if (len <= 0)
 		perror("send failed");
 
@@ -78,20 +81,23 @@ int read_data(int client_fd, int fd, packet_t *packet, char *buffer)
 {
 	u64 len;
 
-	pread(fd, buffer, packet->size, packet->offset);
+	if (pread(fd, buffer, packet->size, packet->offset) != packet->size) {
+		perror("pread fail");
+		return -1;
+	}
 
 #if SERV_DEBUG
 	printf("read: offset(%ld) size(%llu)\n", packet->offset, packet->size);
 	printf("  data: %s\n", buffer);
 #endif
 
-	len = send(client_fd, packet, sizeof(packet_t), 0);
+	len = send(client_fd, packet, sizeof(packet_t), MSG_MORE);
 	if (len <= 0) {
 		perror("send failed");
 		return len;
 	}
 
-	len = send(client_fd, buffer, packet->size, 0);
+	len = send(client_fd, buffer, packet->size, MSG_EOR);
 	if (len <= 0)
 		perror("send failed");
 
@@ -120,7 +126,7 @@ void handle_packet(char *file_path, int ncores)
 		return;
 	}
 
-	fd = open(file_path, O_RDWR | O_DIRECT);
+	fd = open(file_path, O_RDWR); // | O_DIRECT);
 	if (fd < 0) {
 		perror("open error");
 		free(buffer);
@@ -128,8 +134,10 @@ void handle_packet(char *file_path, int ncores)
 	}
 
 	while (1) {
-		if (recv_packet(client_fd, &packet) <= 0)
+		if (recv_packet(client_fd, &packet) <= 0) {
+			perror("fail to receiving metadata");
 			break;
+		}
 
 		switch (packet.op) {
 			case INIT:
@@ -233,10 +241,8 @@ int main(int argc, char *argv[])
 
 	signal(SIGINT, sigint_handler);
 
-	// memcpy(file_path, argv[1], strlen(argv[1]));
-	sprintf(file_path, "%s", "/mnt/nvme/data_file");
+	memcpy(file_path, argv[1], strlen(argv[1]));
 	ncores = get_nprocs();
-	ncores = 4;
 
 	init_server(ncores);
 
